@@ -60,19 +60,32 @@ async fn main() {
             return;
         }
     };
+    
+    // 实例化内存db
     let db = Arc::new(Mutex::new(Db::new(rudis_config.clone())));
+    
+    // 实例化aof持久化
     let aof = Arc::new(Mutex::new(Aof::new(rudis_config.clone(), db.clone())));
+    
+    // 实例化rdb持久化
     let rdb = Arc::new(Mutex::new(Rdb::new(rudis_config.clone(), db.clone())));
+    
+    // 实例化会话管理器
     let session_manager = Arc::new(SessionManager::new(rudis_config.clone()));
+    
+    // 监听tcp
     let listener = TcpListener::bind(socket_addr).unwrap();
 
+    // 打印启动日志
     println_banner(port);
 
     // 数据恢复
     if rudis_config.appendonly {
+        // 加载aof持久化数据
         log::info!("Start performing AOF recovery");
         aof.lock().load();
     } else {
+        // 加载rdb持久化数据
         log::info!("Start performing RDB recovery");
         rdb.lock().load();
     }
@@ -83,7 +96,7 @@ async fn main() {
     let rc = Arc::clone(&db);
     let rcc = Arc::clone(&rudis_config);
 
-    // 检测过期
+    // 定时任务，检测key过期
     tokio::spawn(async move {
         loop {
             rc.lock().check_all_database_ttl();
@@ -92,12 +105,19 @@ async fn main() {
     });
 
     // 保存策略
+    // 生成rdb持久化计数器，用于记录全局写操作的次数
     let arc_rdb_count = Arc::new(Mutex::new(RdbCount::new()));
+    
+    // 获取rdb持久化调度器
     let arc_rdb_scheduler = Arc::new(Mutex::new(RdbScheduler::new(rdb)));
+    
+    // 检查是否配置了rdb持久化策略，例如：(100,1) 100秒内有一次写操作，就进行持久化操作
     if let Some(save_interval) = &rudis_config.save {
+        // 执行rdb持久化
         arc_rdb_scheduler.lock().execute(save_interval.clone(), arc_rdb_count.clone());
     }
 
+    // 处理不同的tcp客户端端连接
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -106,6 +126,8 @@ async fn main() {
                 let session_manager_clone = Arc::clone(&session_manager);
                 let rdb_count_clone = Arc::clone(&arc_rdb_count);
                 let aof_clone = Arc::clone(&aof);
+                
+                // 为当前tcp连接分配一个处理任务
                 tokio::spawn(async move {
                     connection(
                         stream,
@@ -144,16 +166,28 @@ async fn connection(
      * buff_list 完整消息
      * read_size 总读取长度
      */
+    
+    // 获取命令集: 命令 => 执行实例
     let command_strategies = init_command_strategies();
+    
+    // 生成会话id
     let session_id = stream.peer_addr().unwrap().to_string();
+    
+    // 读取tcp内容的缓冲空间：一次读取512个字节
     let mut buff = [0; 512];
+    
+    // 读取总内容
     let mut buff_list = Vec::new();
+    
+    // 读取字节总数
     let mut read_size = 0;
 
     /*
      * 创建会话
      */
     if !session_manager.create_session(session_id.clone()) {
+        // 创建会话失败：
+        // 生成一个错误响应
         let err = "ERR max number of clients reached".to_string();
         let resp_value = RespValue::Error(err).to_bytes();
         match stream.write(&resp_value) {
@@ -164,17 +198,24 @@ async fn connection(
         }
         return;
     }
-
-    'main: loop {
+    
+    'main: loop { // 命名循环，用于多层跳出
+        // 将tcp字节流程读取到buff中，并且返回读取的字节数，一次读取512个字节
         match stream.read(&mut buff) {
             Ok(size) => {
                 if size == 0 {
-                    break 'main;
+                    break 'main; // 结束循环
                 }
 
+                // 获取buff内容的切片，并且将其追加到buff_list的末尾
                 buff_list.extend_from_slice(&buff[..size]);
+                
+                // 累加总数
                 read_size += size;
 
+                // buff的容量为512
+                // 如果当最新一轮读取的字节数小于512说明客户端发送的内容被读取完了，可以进行处理了
+                // 如果没有则进入下一轮循环进行读取
                 if size < 512 {
                     
                     /*
@@ -184,9 +225,38 @@ async fn connection(
                      * fragments: 消息片段
                      * command: 命令
                      */
+                    
+                    // 获取内容
                     let bytes = &buff_list[..read_size];
+                    
+                    // 将u8转为字符串切片
                     let body = std::str::from_utf8(bytes).unwrap();
+                    
+                    // 按CRLF分割，Redis协议固定分隔符，例如：
+                    // 输入：*3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$7\r\nmyvalue\r\n
+                    // 解析后：
+                    // fragments = ["*3", "$3", "SET", "$5", "mykey", "$7", "myvalue"]
+                    // command = "SET"  // fragments[2]
+                    /*
+                        *3 表示这是一个包含3个元素的数组（Array）。星号（*）后面跟着数组元素个数。
+                        \r\n 是分隔符。
+                        $3 表示接下来是一个长度为3的字符串（Bulk String）。
+                        \r\n 分隔符。
+                        SET 是实际的字符串内容，长度为3，符合上一步的说明。
+                        \r\n 分隔符。
+                        $5 表示下一个字符串的长度是5。
+                        \r\n 分隔符。
+                        mykey 是下一个字符串，长度为5。
+                        \r\n 分隔符。
+                        $7 表示下一个字符串的长度是7。
+                        \r\n 分隔符。
+                        myvalue 是下一个字符串，长度为7。
+                        \r\n 分隔符。
+                    */
+                    
                     let fragments: Vec<&str> = body.split("\r\n").collect();
+                    
+                    // 提取命令
                     let command = fragments[2];
 
                     /*
@@ -217,6 +287,8 @@ async fn connection(
                      * 利用策略模式，根据 command 获取具体实现，
                      * 否则响应 PONG 内容。
                      */
+                    
+                    // 根据目录获取对应处理器实例： 命令 => 处理器实例
                     let uppercase_command = command.to_uppercase();
                     if let Some(strategy) = command_strategies.get(uppercase_command.as_str()) {
                         
@@ -224,6 +296,7 @@ async fn connection(
                          * 执行命令
                          * 
                          * @param stream 流
+                         * @param fragments 执行的内容
                          * @param db
                          * @param rudis_config 配置文件
                          * @param sessions 会话列表
@@ -243,7 +316,10 @@ async fn connection(
                          *【备份与恢复】中的恢复。
                          */
                         if let CommandType::Write = strategy.command_type() {
+                            // 写操作计数器+1
                             rdb_count.lock().calc();
+                            
+                            // 触发aof
                             aof.lock().save(&fragments.join("\\r\\n"));
                         }
                     } else {

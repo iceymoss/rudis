@@ -3,3 +3,4 @@ pub mod hget;
 pub mod hdel;
 pub mod hexists;
 pub mod hset;
+pub mod hgetall;

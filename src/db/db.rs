@@ -87,6 +87,8 @@ impl TimedData {
 }
 
 pub struct Db {
+    //存储结构：Vec[0].key = "name"
+    //存储结构：Vec[0].value = TimedData{value: TimedDataValue::String("iceymoss"), expire_at: 17934524}
     pub databases: Vec<AHashMap<String, TimedData>>,
     pub rudis_config: Arc<RudisConfig>,
 }
@@ -657,6 +659,27 @@ impl Db {
             // 数据库索引不存在
             Err("数据库索引不存在")
         }
+    }
+    
+    pub fn hgetall(&self, db_index: usize, key: &str) -> Option<Vec<(&String, &String)>> {
+        //获取db
+        if let Some(db) = self.databases.get(db_index) {
+            // 获取值
+            if let Some(reid_data) = db.get(key) {
+                if let TimedDataValue::Hash(hash_map) = &reid_data.value {
+                    let mut res: Vec<(&String, &String)> = vec![];
+                    // 不可变借用迭代器
+                    for (k, v) in hash_map {
+                        let data = (k, v);
+                        res.push(data)
+                    }
+                    return Some(res)
+                } else {
+                    return None
+                }
+            }
+        }
+        None
     }
 
     pub fn hexists(&self, db_index: usize, key: &str, field: &str) -> Result<bool, &'static str> {

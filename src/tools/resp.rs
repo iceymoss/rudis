@@ -4,7 +4,8 @@ pub enum RespValue {
     Error(String),
     Null,
     BulkString(String),
-    Ok
+    Ok,
+    Array(Vec<RespValue>),
 }
 
 impl RespValue {
@@ -22,6 +23,22 @@ impl RespValue {
                 bytes.extend_from_slice(b"\r\n");
                 bytes.extend_from_slice(s.as_bytes());
                 bytes.extend_from_slice(b"\r\n");
+                bytes
+            },
+            //Array 处理
+            RespValue::Array(elements) => {
+                let mut bytes = Vec::new();
+
+                // RESP 数组格式: *<元素数量>\r\n
+                bytes.extend_from_slice(b"*");
+                bytes.extend_from_slice(elements.len().to_string().as_bytes());
+                bytes.extend_from_slice(b"\r\n");
+
+                // 序列化每个元素
+                for element in elements {
+                    bytes.extend(element.to_bytes());
+                }
+
                 bytes
             },
         }

@@ -10,6 +10,9 @@ use std::fs;
  * @param databases 初始化数据库
  * @param appendfilename 命令持久化文件
  * @param appendonly 是否开启持久化
+ * @param save rdb持久化策略：(n,m) n时间内，有一次修改触发m次持久化处理
+ * @param dbfilename rdb持久化文件
+ * @param dir 持久化文件存储位置
  */
 pub struct RudisConfig {
     pub bind: String,
@@ -97,16 +100,16 @@ impl Default for RudisConfig {
     fn default() -> Self {
         Self {
             bind: "0.0.0.0".to_string(),
-            port: 6379,
+            port: 6378,
             password: None,
             databases: 16,
             dbfilename: Some("dump.rdb".to_string()),
             appendfilename: Some("appendonly.aof".to_string()),
-            appendonly: false,
+            appendonly: true,
             hz: 10,
             appendfsync: None,
             maxclients: 0,
-            save: None,
+            save: Some(vec![(2,1)]),
             dir: "./".to_string(),
         }
     }

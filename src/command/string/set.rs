@@ -73,6 +73,8 @@ impl CommandStrategy for SetCommand {
             },
         };
 
+        // NX 选项(键不存在才设置)
+        // 相当于 Redis 的 SET key value NX
         for (index, fragment) in fragments.iter().enumerate() {
             if fragment.to_uppercase() == "NX" {
                 if index != 4 && index != 6 {
@@ -93,6 +95,8 @@ impl CommandStrategy for SetCommand {
             }
         }
 
+        // XX 选项(键存在才设置）
+        // Redis 的 SET key value XX
         for (index, fragment) in fragments.iter().enumerate() {
             if fragment.to_uppercase() == "XX" {
                 if index != 4 && index != 6 {
@@ -113,9 +117,13 @@ impl CommandStrategy for SetCommand {
             }
         }
 
+        // ttl设置在参数中的位置
         let mut ttl_index = None;
+        
+        // 设置级别：EX => 表示秒，存储时需要统一秒转毫秒; PX => 直接是毫秒
         let mut ttl_unit = None;
 
+        // 从后向前查找 PX/EX 标志
         for (index, f) in fragments.iter().enumerate().rev() {
             if index > 6 {
                 if f.to_uppercase().eq_ignore_ascii_case("PX") || 
@@ -129,8 +137,11 @@ impl CommandStrategy for SetCommand {
 
         let mut expire_at = -1;
         if let Some(ttl_index) = ttl_index {
+            // 获取设置的过期时间值
             if let Some(ttl_str) = fragments.get(ttl_index + 2) {
+                // 转为i64
                 if let Ok(ttl) = ttl_str.parse::<i64>() {
+                    // ttl_unit.unwrap().as_str()解构并且转为str
                     let ttl_millis = match ttl_unit.unwrap().as_str() {
                         "EX" => ttl * 1000,
                         _ => ttl

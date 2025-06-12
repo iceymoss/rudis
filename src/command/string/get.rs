@@ -49,6 +49,7 @@ impl CommandStrategy for GetCommand {
             },
         };
 
+        // 执行rdb读写时需要手动触发一下过期检查
         db_ref.check_ttl(db_index, &key);
 
         match db_ref.get(db_index, &key) {
