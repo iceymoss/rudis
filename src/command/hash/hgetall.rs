@@ -28,7 +28,6 @@ impl CommandStrategy for HgetAllCommand {
         // 获取db编号
         let db_index = {
             let sessions_ref = sessions.lock();
-            let session = sessions_ref.get(session_id);
             if let Some(session) = sessions_ref.get(session_id) {
                 session.get_selected_database()
             } else {
