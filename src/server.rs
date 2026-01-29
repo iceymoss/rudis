@@ -4,11 +4,12 @@ use indicatif::{ProgressBar, ProgressStyle};
 use tokio::net::TcpStream;
 
 use std::path::PathBuf;
-use std::sync::{Arc};
+use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
+use tokio::sync::Mutex;
 
 use crate::args::Args;
 use crate::network::session::Session;
@@ -22,18 +23,25 @@ use crate::replication::ReplicationManager;
 use crate::command::Command;
 use crate::frame::Frame;
 
+mod blocking;
+mod command_handler;
+use blocking::create_blocking_manager;
+use command_handler::try_apply_command;
+
 pub struct Server {
     args: Arc<Args>,
     aof_file: Option<AofFile>,
     aof_sender: Option<Sender<(usize, Frame)>>,
     session_manager: Arc<SessionManager>,
-    db_manager: Arc<DatabaseManager>
+    db_manager: Arc<DatabaseManager>,
+    blocking_manager: Arc<Mutex<crate::store::blocking::BlockingQueueManager>>,
 }
 
 impl Server {
 
     pub fn new(args: Arc<Args>, db_manager: Arc<DatabaseManager>) -> Self {
         let session_manager = Arc::new(SessionManager::new());
+        let blocking_manager = create_blocking_manager();
         let (aof_file, aof_sender) = if args.appendonly == "yes" {
             let file_path = PathBuf::from(&args.dir).join(&args.appendfilename);
             let sync_strategy = SyncStrategy::from_str(&args.appendfsync);
@@ -49,7 +57,8 @@ impl Server {
             aof_file, 
             aof_sender,
             session_manager,
-            db_manager
+            db_manager,
+            blocking_manager,
         }
     }
 
@@ -96,7 +105,8 @@ impl Server {
                             let aof_sender = self.aof_sender.clone(); 
                             let session_manager_clone = self.session_manager.clone();
                             let db_manager_clone = self.db_manager.clone();
-                            let mut handler = Handler::new(db_manager_clone, session_manager_clone, stream, self.args.clone(), aof_sender);
+                            let blocking_manager_clone = self.blocking_manager.clone();
+                            let mut handler = Handler::new(db_manager_clone, session_manager_clone, stream, self.args.clone(), aof_sender, blocking_manager_clone);
                             tokio::spawn(async move {
                                 handler.handle().await;
                             });
@@ -162,7 +172,8 @@ pub struct Handler {
     aof_sender: Option<Sender<(usize, Frame)>>,
     session_manager: Arc<SessionManager>,
     db_manager: Arc<DatabaseManager>,
-    args: Arc<Args>
+    args: Arc<Args>,
+    blocking_manager: Arc<Mutex<crate::store::blocking::BlockingQueueManager>>,
 }
 
 impl Handler {
@@ -178,11 +189,25 @@ impl Handler {
     pub fn get_args(&self) -> &Arc<Args> {
         &self.args
     }
+
+    /// 获取阻塞队列管理器
+    /// 
+    /// 提供对阻塞队列管理器的访问，用于管理客户端阻塞请求
+    pub fn get_blocking_manager(&self) -> &Arc<Mutex<crate::store::blocking::BlockingQueueManager>> {
+        &self.blocking_manager
+    }
+
+    /// 获取会话管理器
+    /// 
+    /// 提供对会话管理器的访问，用于管理客户端会话
+    pub fn get_session_manager(&self) -> &Arc<SessionManager> {
+        &self.session_manager
+    }
 }
 
 impl Handler {
 
-    pub fn new(db_manager: Arc<DatabaseManager>, session_manager: Arc<SessionManager>, stream: TcpStream, args: Arc<Args>, aof_sender: Option<Sender<(usize,Frame)>>) -> Self {
+    pub fn new(db_manager: Arc<DatabaseManager>, session_manager: Arc<SessionManager>, stream: TcpStream, args: Arc<Args>, aof_sender: Option<Sender<(usize,Frame)>>, blocking_manager: Arc<Mutex<crate::store::blocking::BlockingQueueManager>>) -> Self {
         let args_ref = args.as_ref();
         let certification = args_ref.requirepass.is_none();
         let sender = db_manager.as_ref().get_sender(0);
@@ -196,6 +221,7 @@ impl Handler {
             session_manager,
             db_manager,
             args,
+            blocking_manager,
         }
     }
 
@@ -252,6 +278,9 @@ impl Handler {
             let bytes = match self.session.connection.read_bytes().await {
                 Ok(bytes) => bytes,
                 Err(_e) => {
+                    // 清理阻塞请求
+                    let mut blocking_manager = self.blocking_manager.lock().await;
+                    blocking_manager.cleanup_session(self.session.get_id());
                     self.session_manager.remove_session(self.session.get_id());
                     return;
                 }
@@ -331,6 +360,11 @@ impl Handler {
     
     /// 执行服务器命令
     async fn apply_command(&mut self, command: Command) -> Result<Frame, Error> {
+        // 尝试使用统一的命令处理入口（处理需要 Handler 上下文的命令）
+        if let Some(result) = try_apply_command(self, &command).await {
+            return result;
+        }
+
         match command {
             Command::Auth(auth) => auth.apply(self),
             Command::Client(client) => client.apply(),
@@ -404,17 +438,14 @@ impl Handler {
     }
 
     /// 执行数据库命令
-    async fn apply_db_command(&self, command: Command) -> Result<Frame, Error> {
+    pub async fn apply_db_command(&self, command: Command) -> Result<Frame, Error> {
         let (sender, receiver) = oneshot::channel();
         let message = DatabaseMessage::Command { sender, command };
         let db_sender = self.session.get_sender();
         if let Err(e) = db_sender.send(message).await {
             return Ok(Frame::Error(format!("Channel closed: {:?}", e)));
         }
-        let result = match receiver.await {
-            Ok(f) => f,
-            Err(e) => Frame::Error(format!("{:?}", e))
-        };
+        let result = receiver.await.unwrap_or_else(|e| Frame::Error(format!("{:?}", e)));
         Ok(result)
     }
 

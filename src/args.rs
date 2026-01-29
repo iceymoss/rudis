@@ -42,7 +42,7 @@ pub struct Args {
     pub hz: f64,
 
     /// 监听端口
-    #[arg(short, long, default_value = "6379")]
+    #[arg(short, long, default_value = "6377")]
     pub port: String,
 
     /// 当前节点类型指示（用于标识节点在 Redis 集群架构中的角色）
@@ -55,7 +55,7 @@ pub struct Args {
     pub loglevel: String,
 
     /// 持久化配置 - 是否开启
-    #[arg(long, default_value = "no")] 
+    #[arg(long, default_value = "yes")] 
     pub appendonly: String,
 
     /// 持久化配置 - 数据文件名称
@@ -71,7 +71,7 @@ pub struct Args {
     pub maxclients: usize,
 
     /// Web 管理界面端口
-    #[arg(long, default_value = "8080")]
+    #[arg(long, default_value = "8089")]
     pub webport: u16,
 
     /// Web 管理界面用户名
