@@ -15,7 +15,7 @@
 
 ### 1. Trait 定义：`HandlerAsyncCommand`
 
-位置：`src/cmds/traits.rs`
+位置：`src/cmds/async_command.rs`
 
 ```rust
 pub trait HandlerAsyncCommand: Sized + Clone {
@@ -38,6 +38,10 @@ pub trait HandlerAsyncCommand: Sized + Clone {
 - 所有需要 Handler 的异步命令都实现这个 trait
 - 命令自己负责所有业务逻辑（阻塞、超时、唤醒等）
 - Handler 只提供资源访问，不包含业务逻辑
+
+> 说明：
+> - 当前项目中还预留了一个更通用的统一接口（`CommandContext` + `Command` trait），用于未来把“普通命令”和“需要 Handler 的命令”统一到同一套接口上。
+> - 但**当前实际接入并使用**的是本文档描述的 `HandlerAsyncCommand`（以及 `command_handler.rs` 的统一调度入口）。
 
 ### 2. 命令实现示例：`BLPOP`
 
@@ -82,15 +86,18 @@ pub async fn try_apply_command(
     match command {
         // 纯异步阻塞命令：通过 HandlerAsyncCommand trait 调用
         Command::Blpop(blpop) => {
-            Some(blpop.clone().apply(handler).await)
+            Some(HandlerAsyncCommand::apply(blpop.clone(), handler).await)
         }
         Command::Brpop(brpop) => {
-            Some(brpop.clone().apply(handler).await)
+            Some(HandlerAsyncCommand::apply(brpop.clone(), handler).await)
         }
         
         // 需要阻塞检查的写命令：先尝试唤醒阻塞客户端，再走 Db
-        Command::Lpush(_) | Command::Rpush(_) => {
-            Some(handle_blocking_aware_command(handler, command.clone()).await)
+        Command::Lpush(lpush) => {
+            Some(handle_blocking_aware_command(handler, Command::Lpush(lpush.clone())).await)
+        }
+        Command::Rpush(rpush) => {
+            Some(handle_blocking_aware_command(handler, Command::Rpush(rpush.clone())).await)
         }
         
         // 其他命令：不在这里处理，返回 None 让调用者按普通命令处理
@@ -209,6 +216,24 @@ impl Handler {
    - 在 `command_handler.rs::handle_blocking_aware_command` 中处理
    - 如果有等待者，直接唤醒；否则正常执行数据库操作
 
+### 阻塞列表的配套组件（BlockingQueueManager）
+
+位置：`src/store/blocking.rs`
+
+阻塞能力由独立的阻塞队列管理器提供（不放在 `server.rs` 里），核心思想是：
+- **等待队列按 key 组织**：`key -> FIFO 等待队列`
+- **等待者通过 oneshot 收到结果**：写命令触发唤醒时向等待者发送响应帧
+- **支持断连清理与超时清理**：避免资源泄漏
+
+关键结构（简述）：
+- `BlockDirection { Left, Right }`：区分 BLPOP / BRPOP
+- `BlockingRequest`：记录 `session_id`、`key`、`direction`、`timeout`、`response_sender`、`created_at`
+- `BlockingQueueManager`：
+  - `register_blocking_request(...) -> oneshot::Receiver<Frame>`
+  - `try_wakeup(key, direction, value) -> Option<(session_id, Frame)>`
+  - `cleanup_session(session_id)`
+  - `cleanup_timeout_requests()`
+
 ## 优势
 
 1. **模块化**：每个命令的完整逻辑都在自己的文件中
@@ -229,6 +254,62 @@ impl Handler {
 1. **更多异步命令**：可以按照这个标准实现其他需要 Handler 的异步命令
 2. **Trait 优化**：可以考虑添加默认实现或辅助方法
 3. **文档生成**：可以基于 trait 自动生成命令文档
+
+### 扩展示例：RPOPLPUSH / BRPOPLPUSH（设计思路）
+
+#### 1) RPOPLPUSH（普通命令）
+
+语义：
+- 从 `source` 列表右侧弹出一个元素
+- 将该元素从左侧推入 `destination`
+- 返回该元素；若 `source` 为空返回 `Null`
+
+实现建议：
+- 作为普通命令放在 `src/cmds/listing/rpoplpush.rs`
+- 复用现有 list 结构与类型检查逻辑，保证 WRONGTYPE 行为一致
+
+#### 2) BRPOPLPUSH（异步命令，推荐实现为 HandlerAsyncCommand）
+
+语义：
+- 若 `source` 非空，行为与 `RPOPLPUSH` 相同
+- 若 `source` 为空，则阻塞等待直到有元素或超时；超时返回 `Null`
+
+实现建议（与 BLPOP/BRPOP 一致的模式）：
+- 放在 `src/cmds/listing/brpoplpush.rs` 并实现 `HandlerAsyncCommand`
+- `apply` 内部流程：
+  - 先尝试一次非阻塞的 `RPOPLPUSH`（可通过构造 `Frame` -> `Command` -> `handler.apply_db_command(...)` 复用现有执行路径）
+  - 若为空则注册阻塞请求（在 `BlockingQueueManager` 上针对 `source` 注册 `Right` 方向等待）
+  - `tokio::select!` 等待 `receiver` 或 `sleep(timeout)`
+  - 被唤醒后再完成 “push 到 destination” 的数据库更新（保持语义清晰，减少对阻塞管理器的侵入）
+
+> 备注：
+> - 更严格的 Redis 兼容实现可以支持多 key 的阻塞与唤醒，但当前阻塞管理器可能做了“只处理第一个 key”的简化，这部分可作为后续增强点。
+
+### 扩展示例：Pub/Sub（如何接入异步命令标准）
+
+Pub/Sub 的命令通常需要会话上下文（订阅模式、向同一连接持续推送消息），因此非常适合使用 `HandlerAsyncCommand`：
+- `SUBSCRIBE` / `UNSUBSCRIBE`
+- `PSUBSCRIBE` / `PUNSUBSCRIBE`
+- `PUBLISH`（也可走异步标准，统一入口）
+- `PUBSUB`（查询订阅信息）
+
+实现建议：
+- 新增 `PubSubManager`（建议持有在 `Handler` 或 `Server` 上，例如 `Arc<Mutex<PubSubManager>>`），维护：
+  - `channel -> subscribers`
+  - `pattern -> subscribers`
+  - `session_id -> subscriptions`（断连清理）
+- `SUBSCRIBE` 的 `apply` 典型流程：
+  - 通过 `handler` 获取当前 `session_id` 与连接写通道
+  - 注册订阅到 `PubSubManager`
+  - 让 Session 进入 “订阅模式”（`Handler` 的读循环需要在订阅模式下同时处理：客户端命令 + 订阅消息推送）
+  - 发送 Redis 规范的订阅确认帧（`["subscribe", channel, count]`）
+- `PUBLISH`：
+  - 在 `PubSubManager` 内对订阅者广播 `["message", channel, payload]` / `["pmessage", pattern, channel, payload]`
+  - 返回接收者数量
+
+接入点：
+- 在 `Command` 枚举与 `parse_from_frame` 添加命令分支
+- 在 `src/server/command_handler.rs::try_apply_command` 为这些命令添加 match 分支（像 BLPOP/BRPOP 一样）
 
 ## 总结
 
